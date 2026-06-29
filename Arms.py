@@ -1,21 +1,24 @@
 import os
 import platform
 import time
+import math
 
-USE_REAL_GPIO = platform.system() == 'Linux' and os.path.exists('/proc/cpuinfo')
-Servo = None
-REAL_GPIO_AVAILABLE = False
-
-if USE_REAL_GPIO:
+def is_raspberry_pi():
     try:
-        from gpiozero import Servo
-        REAL_GPIO_AVAILABLE = True
-    except ImportError:
-        Servo = None
+        with open('/proc/device-tree/model', 'r') as f:
+            return 'Raspberry Pi' in f.read()
+    except:
+        return False
+
+USE_REAL_GPIO = platform.system() == 'Linux' and is_raspberry_pi()
+
+try:
+    from gpiozero import Servo as GPIOServo
+except Exception:
+    GPIOServo = None
 
 
 class DummyServo:
-
     def __init__(self, pin):
         self.pin = pin
         self._value = 0
@@ -25,110 +28,149 @@ class DummyServo:
         return self._value
 
     @value.setter
-    def value(self, value):
-        if value is None:
-            self._value = None
-        elif -1 <= value <= 1:
-            self._value = value
+    def value(self, v):
+        if v is None:
+            self._value = 0
         else:
-            raise ValueError('Servo value must be between -1 and 1 or None')
-
-
-class MotionSmoother:
-
-    def __init__(self, step: float = 0.05, delay: float = 0.02):
-        self.step = step
-        self.delay = delay
-
-    def move(self, servo, current_position: float, target_position: float) -> float:
-        target_position = max(-1, min(1, target_position))
-        while abs(current_position - target_position) > self.step:
-            current_position += self.step if current_position < target_position else -self.step
-            servo.value = current_position
-            time.sleep(self.delay)
-        servo.value = target_position
-        return target_position
+            self._value = max(-1, min(1, float(v)))
 
 
 class RobotArm:
-
-    def __init__(self, gpio_pin: int = 17, smoother=None):
+    def __init__(self, gpio_pin, name="arm", min_limit=-1, max_limit=1, offset=0.0):
         self.gpio_pin = gpio_pin
+        self.name = name
+
+        self.min_limit = min_limit
+        self.max_limit = max_limit
+        self.offset = offset
+
         self.servo = self._create_servo()
-        self.current_position = 0
-        self.servo.value = 0
-        self.smoother = smoother
+
+        self.position = 0.0
+        self.target = 0.0
+        self.velocity = 0.0
+
+        self.max_speed = 0.08
+        self.accel = 0.02
+        self.active = True
 
     def _create_servo(self):
-        if not REAL_GPIO_AVAILABLE or Servo is None:
-            print('Info: running in dummy servo mode.')
+        if not USE_REAL_GPIO or GPIOServo is None:
             return DummyServo(self.gpio_pin)
-
         try:
-            return Servo(self.gpio_pin)
-        except Exception as exc:
-            print('Warning: unable to initialize GPIO servo:', exc)
-            print('Info: running in dummy servo mode.')
+            s = GPIOServo(self.gpio_pin)
+            s.value = 0
+            return s
+        except:
             return DummyServo(self.gpio_pin)
 
-    def move_to_position(self, target_position: float, smooth: bool = False):
-        target_position = max(-1, min(1, target_position))
-        if smooth and self.smoother:
-            self.current_position = self.smoother.move(self.servo, self.current_position, target_position)
-        else:
-            self.servo.value = target_position
-            self.current_position = target_position
+    def set_target(self, target):
+        self.target = max(self.min_limit, min(self.max_limit, float(target) + self.offset))
+        self.velocity = 0.0
+        self.active = True
 
     def stop(self):
         self.servo.value = None
-        self.current_position = None
+        self.velocity = 0.0
+        self.active = False
 
-    def get_position(self):
-        return self.current_position
+    def update(self):
+        if not self.active:
+            return
+
+        error = self.target - self.position
+
+        if abs(error) < 0.003 and abs(self.velocity) < 0.003:
+            self.position = self.target
+            self.velocity = 0.0
+            self.servo.value = self.position
+            return
+
+        desired = max(-self.max_speed, min(self.max_speed, error))
+
+        self.velocity = (
+            self.velocity * (1 - self.accel)
+            + desired * self.accel
+        )
+
+        self.velocity *= 0.9
+
+        self.position += self.velocity
+        self.position = max(-1, min(1, self.position))
+
+        self.servo.value = self.position
 
 
 class ArmController:
-
-    def __init__(self):
+    def __init__(self, hz=60):
         self.arms = {}
+        self.hz = hz
+        self.running = False
 
-    def register_arm(self, arm_id: str, robot_arm: RobotArm):
-        self.arms[arm_id] = robot_arm
+    def register_arm(self, name, arm):
+        self.arms[name] = arm
 
-    def move_arm(self, arm_id: str, target_position: float, smooth: bool = False):
-        arm = self.arms.get(arm_id)
+    def set_target(self, name, target):
+        arm = self.arms.get(name)
         if arm:
-            arm.move_to_position(target_position, smooth)
+            arm.set_target(target)
 
-    def stop_all_arms(self):
-        for arm in self.arms.values():
-            arm.stop()
+    def stop_all(self):
+        for a in self.arms.values():
+            a.stop()
 
-    def get_arm_position(self, arm_id: str):
-        arm = self.arms.get(arm_id)
-        return arm.get_position() if arm else None
+    def update_all(self):
+        for a in self.arms.values():
+            a.update()
+
+    def run_loop(self):
+        self.running = True
+        dt = 1.0 / self.hz
+
+        try:
+            while self.running:
+                start = time.time()
+
+                self.update_all()
+
+                elapsed = time.time() - start
+                sleep_time = dt - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            self.stop_all()
+            self.running = False
+
+    def stop(self):
+        self.running = False
 
 
-def create_default_controller() -> ArmController:
-    smoother = MotionSmoother(step=0.05, delay=0.02)
-    controller = ArmController()
+def create_default_controller():
+    c = ArmController(hz=60)
 
-    base = RobotArm(gpio_pin=17, smoother=smoother)
-    elbow = RobotArm(gpio_pin=18, smoother=smoother)
+    c.register_arm("base", RobotArm(17, "base"))
+    c.register_arm("elbow", RobotArm(18, "elbow"))
 
-    controller.register_arm('base', base)
-    controller.register_arm('elbow', elbow)
-    return controller
+    return c
 
 
-def main() -> None:
-    controller = create_default_controller()
-    controller.move_arm('base', 0.5)
-    time.sleep(1)
-    controller.move_arm('elbow', -0.5, smooth=True)
-    time.sleep(1)
-    controller.stop_all_arms()
+def main():
+    robot = create_default_controller()
+
+    robot.set_target("base", 0.6)
+    robot.set_target("elbow", -0.4)
+
+    start = time.time()
+    while time.time() - start < 2:
+        robot.update_all()
+        time.sleep(0.02)
+
+    robot.set_target("base", -0.6)
+    robot.set_target("elbow", 0.4)
+
+    robot.run_loop()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
